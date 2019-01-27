@@ -1,0 +1,275 @@
+#!/bin/sh
+#
+# SliTaz takeover script
+# Hijacks the current distro and replaces it with SliTaz
+#
+# © 2019 by luk3yx
+#
+
+# Download URLs
+md5sum_url="http://mirror1.slitaz.org/iso/rolling"
+iso_url="https://download.tuxfamily.org/slitaz/iso/rolling"
+
+# To execute fun harmful init swapping™, you need to be root.
+if [ "$(id -ru)" != 0 ]; then
+    echo "ERROR: You are not root! Attempting to gain root..."
+    echo
+    exec sudo "$0"
+    echo "Failed to gain root!"
+    exit 127
+fi
+
+# Quote function - https://unix.stackexchange.com/a/445477
+quote() { printf %s\\n "$1" | sed "s/'/'\\\\''/g;1s/^/'/;\$s/\$/'/" ; }
+
+# Make sure the user understands the risks
+echo "Welcome to SliTaz takeover!"
+echo "Please make sure you have no unsaved work."
+read -rp "Are you sure you want to continue? [y/N] " confirmation
+
+case "$confirmation" in
+    y|Y)
+    echo "Getting your CPU architecture..."
+    ;;
+
+    *)
+    echo "Aborting..."
+    exit
+esac
+
+# Make sure the user is running on i386 or x86_64
+case "`uname -m`" in
+    x86_64)
+    file="slitaz-rolling-core64.iso"
+    md5="slitaz-rolling-core64.md5"
+    ;;
+
+    i?86)
+    file="slitaz-rolling-core.iso"
+    md5="slitaz-rolling-core.md5"
+    ;;
+
+    *)
+    echo "ERROR: Could not detect your CPU architecture!"
+    exit 1
+    ;;
+esac
+
+# Create a temporary directory
+tmp=$(mktemp -d)
+trap 'rm -r "$tmp"' EXIT
+cd "$tmp"
+
+# Download the MD5SUM
+echo "Downloading the md5sum for '$file'..."
+expected_md5sum=$(wget -O- "$md5sum_url/$md5" | cut -d ' ' -f1)
+
+# Check for the ISO file
+if [ -e "$OLDPWD/$file" ]; then
+    echo "Using already downloaded '$file'."
+    cp "$OLDPWD/$file" "$file"
+else
+    echo "Downloading '$file'..."
+    wget "$iso_url/$file"
+fi
+
+echo "Checking the md5sum..."
+actual_md5sum=$(md5sum < "$file" | cut -d ' ' -f1)
+if [ "$actual_md5sum" != "$expected_md5sum" ]; then
+    echo "ERROR: Checksums do not match!"
+    echo "Expected $actual_md5sum, got $expected_md5sum."
+    exit 1
+fi
+
+# Create a tmpfs
+echo 'Mounting the .iso and creating a tmpfs...'
+cleanup() {
+    echo "Aborting takeover..."
+
+    # Unmount /dev etc
+    for f in dev/pts dev sys proc; do
+        umount "$tmp/ramfs/$f" || umount -f "$tmp/ramfs/$f" || return
+    done
+
+    # Nuke the ramfs
+    rm -r -- "$tmp"/ramfs/*
+
+    # Unmount the iso and ramfs
+    for f in ramfs cdrom; do
+        if [ -e "$tmp/$f" ]; then
+            umount "$tmp/$f" || umount -f "$tmp/$f" || umount -fl "$tmp/$f"
+        fi
+    done
+
+    # Nuke the temporary directory
+    rm -r "$tmp"
+}
+trap cleanup EXIT
+
+mkdir ramfs cdrom
+
+mount -o ro "$file" cdrom
+mount -t tmpfs -o mode=755 tmpfs "$tmp/ramfs"
+echo
+
+# Extract the ISO file
+echo 'Extracting SliTaz into RAM...'
+cd "$tmp/ramfs"
+lzma -d < "$tmp/cdrom/boot/rootfs.gz" 2>/dev/null | cpio -idm
+
+if [ ! -e "init" ]; then
+    echo "Error extracting files!"
+    exit 1
+fi
+
+# Set up the tmpfs with system folders
+for dir in dev dev/pts sys proc; do
+    mkdir --mode=755 "$tmp/ramfs/$dir" 2>/dev/null
+    mount --bind "/$dir" "$tmp/ramfs/$dir"
+done
+
+# Create /mnt
+echo
+[ ! -e mnt ] && mkdir "mnt"
+
+# Create the transitional init script
+echo "Creating transitional init scripts..."
+quoted_tmp="$(quote "$tmp/ramfs")"
+cat > init <<EOF
+#!/bin/sh
+cd $quoted_tmp
+
+# Change TTY to tty1, clear scrollback, and redirect stdin/out
+chvt 1
+printf '\033c' > /dev/tty1
+sleep 1
+chvt 2
+chvt 1
+exec < /dev/console > /dev/console 2>&1
+
+echo "SliTaz takeover"
+echo "Performing a soft shutdown..."
+echo
+echo "Sending SIGTERM to all processes..."
+
+# Send a SIGTERM to all processes
+kill -15 -1
+
+# Give the processes a chance to exit
+echo
+echo
+for i in 3 2 1; do
+    printf "\033[ATakeover in \$i second(s).\n"
+    sleep 1
+done
+printf "\033[ATakeover in 0 second(s).\n"
+
+# SIGKILL everything
+echo "Sending SIGKILL to all processes..."
+kill -9 -1
+sleep 1
+
+# Change the root directory
+echo "Changing root directory..."
+mount --make-rprivate /
+pivot_root . mnt || exit
+
+# Execute the second transitional init
+exec chroot . /init2
+EOF
+
+echo
+
+cat > init2 <<'EOF'
+#!/bin/sh
+cd /
+
+# Unmount the old root and free up RAM
+echo "Unmounting the old root directory..."
+umount -R "/mnt" || umount -Rf "/mnt" || umount -Rfl "/mnt"
+
+# Lock encrypted volumes
+echo "Locking encrypted volumes..."
+cd /dev/mapper
+for disk in *; do
+    if [ "$disk" != "control" ]; then
+        cryptsetup close -- "$disk" >/dev/null 2>&1
+    fi
+done
+cd /
+unset disk
+echo
+
+# Unmount /dev and /proc, SliTaz will re-add them later
+echo "Cleaning up..."
+rm init init2
+umount /dev /proc
+
+# Execute the SliTaz init
+echo "Chainloading the SliTaz init..."
+exec /sbin/init
+EOF
+
+# Make sure both /init and /init2 are executable
+chmod 700 init init2
+
+# Copy across shared libraries for cryptsetup
+copy_binary() {
+    if [ -e "$1" ] && [ ! -e ".$1" ]; then
+        local files
+        n=$(printf '\n')
+        files=$(ldd "$1"                                                       \
+  | awk 'BEGIN{ORS=" "}$1'"$(printf '\n')"'~/^\//{print $1}$3~/^\//{print $3}' \
+  | sed 's/,$/\n/')
+        local f
+        for f in $files; do
+            [ -e "$f" ] && cp -n "$f" "./lib"
+        done
+        cp "$1" ".$1"
+    fi
+}
+
+echo "Copying cryptsetup (if installed)..."
+copy_binary /sbin/cryptsetup
+
+# Create /etc/mtab
+echo "Copying mtab and unmounting the ISO file..."
+[ -e etc/mtab ] && rm etc/mtab
+cp -d /etc/mtab etc/mtab
+
+# Unmount the iso file
+umount "$tmp/cdrom" || umount -f "$tmp/cdrom"
+rmdir "$tmp/cdrom"
+rm "$tmp/$file"
+echo
+
+# Is the user SURE they want to continue
+printf 'Are you \033[1mSURE\033[22m you want to continue?\n'
+echo "This is your last chance to cancel!"
+read -rp "Do you want SliTaz takeover to continue? [y/N] " confirmation
+
+case "$confirmation" in
+    y|Y)
+    echo
+    ;;
+
+    *)
+    exit
+    ;;
+esac
+
+# Switch to the transitional init
+init_loc=$(readlink /proc/1/exe)
+mount --bind init "$init_loc"
+
+# Hijack init
+echo "Hijacking init..."
+trap EXIT
+telinit u
+
+# Time out
+sleep 5
+echo "Timeout in 5 seconds."
+sleep 5
+echo "Init takeover failed!"
+cleanup
