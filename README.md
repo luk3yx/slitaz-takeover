@@ -19,7 +19,7 @@ takeover, so do not have any unsaved work.
 To use `slitaz-takeover`:
 
 1. Download `slitaz-takeover`.
-1. If you're paranoid about security, inspect the source code.
+1. Optionally inspect the source code.
 1. Execute it (as root).
 
 To revert back to your original system, you can simply reboot your computer. All
